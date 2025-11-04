@@ -1145,7 +1145,6 @@ Ppk = {currentResult.Ppk:F4}
                 AddExtension = true,
                 DefaultExt = "pdf",
                 FileName = defaultFileName,
-                // 탐색기 시작 위치를 원본 파일 폴더로
                 InitialDirectory = !string.IsNullOrWhiteSpace(loadedFilePath)
                     ? Path.GetDirectoryName(loadedFilePath)
                     : Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments),
@@ -1154,17 +1153,356 @@ Ppk = {currentResult.Ppk:F4}
 
             if (sfd.ShowDialog() == DialogResult.OK)
             {
-                try
+                // 프로그레스 다이얼로그 생성
+                int totalSteps = CalculateTotalSteps();
+                var progressDialog = new ProgressDialog("PDF 생성 중...", totalSteps);
+
+                // 백그라운드 작업으로 PDF 생성
+                var bgWorker = new System.ComponentModel.BackgroundWorker
                 {
-                    ExportToPdf(sfd.FileName);
-                    MessageBox.Show("PDF로 내보냈습니다.", "완료",
-                        MessageBoxButtons.OK, MessageBoxIcon.Information);
-                }
-                catch (Exception ex)
+                    WorkerReportsProgress = true
+                };
+
+                bgWorker.DoWork += (s, args) =>
                 {
-                    MessageBox.Show($"PDF 내보내기 중 오류: {ex.Message}", "오류",
-                        MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    try
+                    {
+                        ExportToPdfWithProgress(sfd.FileName, bgWorker, progressDialog);
+                        args.Result = true;
+                    }
+                    catch (Exception ex)
+                    {
+                        args.Result = ex;
+                    }
+                };
+
+                bgWorker.RunWorkerCompleted += (s, args) =>
+                {
+                    progressDialog.Close();
+                    progressDialog.Dispose();
+
+                    if (args.Result is Exception ex)
+                    {
+                        MessageBox.Show($"PDF 내보내기 중 오류: {ex.Message}", "오류",
+                            MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    }
+                    else
+                    {
+                        MessageBox.Show("PDF로 내보냈습니다.", "완료",
+                            MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    }
+                };
+
+                progressDialog.Show(this);
+                bgWorker.RunWorkerAsync();
+            }
+        }
+
+        private int CalculateTotalSteps()
+        {
+            // 단계 계산: 초기화(1) + 표지(1) + 그리드(1) + (항목별: 차트 생성 + 데이터 테이블) * 항목수 + 렌더링(1)
+            int itemCount = currentResult != null ? 1 : testItems.Count(item => item.Values.Where(v => v != 0).Count() >= 2);
+            return 3 + (itemCount * 2) + 1;
+        }
+
+        private void ExportToPdfWithProgress(string filePath,
+    System.ComponentModel.BackgroundWorker worker,
+    ProgressDialog progressDialog)
+        {
+            int currentStep = 0;
+
+            void ReportProgress(string status)
+            {
+                currentStep++;
+                progressDialog.UpdateProgress(currentStep, status);
+                System.Threading.Thread.Sleep(50); // 프로그레스 시각화를 위한 짧은 지연
+            }
+
+            string SaveChartImage(Chart ch)
+            {
+                string tmp = Path.Combine(Path.GetTempPath(), $"cpk_chart_{Guid.NewGuid():N}.png");
+                ch.AntiAliasing = AntiAliasingStyles.All;
+                ch.TextAntiAliasingQuality = TextAntiAliasingQuality.High;
+                foreach (ChartArea a in ch.ChartAreas) a.RecalculateAxesScale();
+                ch.Invalidate();
+                ch.SaveImage(tmp, ChartImageFormat.Png);
+                return tmp;
+            }
+
+            if (string.IsNullOrWhiteSpace(filePath))
+                throw new ArgumentException("저장 경로가 비어 있습니다.", nameof(filePath));
+
+            ReportProgress("문서 초기화 중...");
+
+            // 1) 문서 & 스타일
+            var doc = new Document();
+            doc.Info.Title = "CPK 분석 보고서";
+
+            var normal = doc.Styles["Normal"];
+            normal.Font.Name = "Malgun Gothic";
+            normal.Font.Size = 10;
+
+            var heading = doc.Styles.AddStyle("Heading", "Normal");
+            heading.Font.Size = 14;
+            heading.Font.Bold = true;
+
+            // 2) 섹션 & 용지 세팅 (A4 가로)
+            var sec = doc.AddSection();
+            sec.PageSetup.PageFormat = PageFormat.A4;
+            sec.PageSetup.Orientation = MigraDocCore.DocumentObjectModel.Orientation.Landscape;
+            sec.PageSetup.TopMargin = "15mm";
+            sec.PageSetup.BottomMargin = "15mm";
+            sec.PageSetup.LeftMargin = "15mm";
+            sec.PageSetup.RightMargin = "15mm";
+
+            ReportProgress("표지 생성 중...");
+
+            // 3) 표지/개요
+            var title = sec.AddParagraph("CPK 분석 보고서", "Heading");
+            title.Format.SpaceAfter = "6mm";
+
+            var info = sec.AddParagraph();
+            info.AddText($"생성일시: {DateTime.Now:yyyy-MM-dd HH:mm:ss}\n");
+            info.AddText($"총 항목 수: {this.testItems?.Count ?? 0}\n");
+            info.Format.SpaceAfter = "6mm";
+
+            ReportProgress("데이터 그리드 생성 중...");
+
+            // 4) 데이터 요약 테이블 (DataGridView)
+            var tblTitle = sec.AddParagraph("데이터 요약(그리드):", "Heading");
+            tblTitle.Format.SpaceBefore = "3mm";
+
+            var table = sec.AddTable();
+            table.Borders.Width = 0.5;
+            table.Rows.LeftIndent = 0;
+            table.Format.Font.Name = "Malgun Gothic";
+            table.Format.Font.Size = 9;
+
+            foreach (DataGridViewColumn col in this.dataGridView.Columns)
+            {
+                double cm =
+                    col.Width <= 60 ? 2.0 :
+                    col.Width <= 90 ? 2.8 :
+                    col.Width <= 120 ? 3.5 : 4.0;
+
+                var c = table.AddColumn(Unit.FromCentimeter(cm));
+                c.Format.Alignment = ParagraphAlignment.Center;
+            }
+
+            var header = table.AddRow();
+            header.HeadingFormat = true;
+            header.Shading.Color = Colors.LightGray;
+            header.Format.Font.Bold = true;
+
+            for (int i = 0; i < this.dataGridView.Columns.Count; i++)
+                header.Cells[i].AddParagraph(this.dataGridView.Columns[i].HeaderText ?? "");
+
+            foreach (DataGridViewRow dgvr in this.dataGridView.Rows)
+            {
+                if (dgvr.IsNewRow) continue;
+                var r = table.AddRow();
+                for (int i = 0; i < this.dataGridView.Columns.Count; i++)
+                {
+                    var val = dgvr.Cells[i].Value?.ToString() ?? "";
+                    r.Cells[i].AddParagraph(val);
                 }
+            }
+
+            var tempFilesList = new List<string>();
+            try
+            {
+                var chartSecTitle = sec.AddParagraph("차트 및 분석 요약", "Heading");
+                chartSecTitle.Format.PageBreakBefore = true;
+                chartSecTitle.Format.SpaceAfter = "2mm";
+
+                if (currentResult != null)
+                {
+                    ReportProgress($"차트 생성 중: {currentResult.ItemName}");
+                    InsertChartAndSummarySideBySide(sec, currentResult, tempFilesList);
+
+                    ReportProgress($"데이터 테이블 생성 중: {currentResult.ItemName}");
+                    InsertRawDataTable(sec, currentResult);
+                }
+                else
+                {
+                    int itemIndex = 0;
+                    foreach (var item in testItems)
+                    {
+                        var valid = item.Values.Where(v => v != 0).ToArray();
+                        if (valid.Length < 2) continue;
+
+                        itemIndex++;
+                        ReportProgress($"차트 생성 중: {item.ItemName} ({itemIndex}/{testItems.Count})");
+
+                        var rEach = ProcessCapabilityAnalyzer.CalculateProcessCapability(
+                                        valid, item.LSL, item.USL, item.ItemName, item.Unit, true, item.Step);
+
+                        InsertChartAndSummarySideBySide(sec, rEach, tempFilesList);
+
+                        ReportProgress($"데이터 테이블 생성 중: {item.ItemName} ({itemIndex}/{testItems.Count})");
+                        InsertRawDataTable(sec, rEach);
+                    }
+                }
+            }
+            finally
+            {
+                foreach (var f in tempFilesList)
+                    try { if (File.Exists(f)) File.Delete(f); } catch { }
+            }
+
+            ReportProgress("PDF 렌더링 중...");
+
+            // 9) PDF 렌더
+            var renderer = new PdfDocumentRenderer(unicode: true)
+            {
+                Document = doc
+            };
+            renderer.RenderDocument();
+            renderer.PdfDocument.Save(filePath);
+
+            ReportProgress("완료!");
+
+            // ====== 로컬 헬퍼들 ======
+
+            void InsertChartAndSummarySideBySide(
+                Section section,
+                ProcessCapabilityAnalyzer.CapabilityResult r,
+                List<string> tmpFiles)
+            {
+                var h = section.AddParagraph($"{r.Step} - {r.ItemName} – 차트 & 분석 요약", "Heading");
+                h.Format.SpaceBefore = "2mm";
+                h.Format.SpaceAfter = "2mm";
+                h.Format.KeepWithNext = true;
+
+                var table = section.AddTable();
+                table.Borders.Width = 0;
+                table.Rows.LeftIndent = 0;
+                table.Format.Font.Name = "Malgun Gothic";
+                table.Format.Font.Size = 9;
+
+                var colChart = table.AddColumn(Unit.FromCentimeter(19.0));
+                var colSummary = table.AddColumn(Unit.FromCentimeter(7.0));
+
+                var row = table.AddRow();
+                row.TopPadding = Unit.FromMillimeter(1.5);
+                row.BottomPadding = Unit.FromMillimeter(1.5);
+
+                if (r.StdDev <= 1e-10)
+                {
+                    var p = row.Cells[0].AddParagraph(
+                        $"변동 없음(모든 값 동일)\n" +
+                        $"측정값 {r.Mean:F4} {r.Unit}\nLSL {r.LSL:F4}, USL {r.USL:F4}\n\n차트 생략"
+                    );
+                    p.Format.Font.Size = 10;
+                }
+                else
+                {
+                    var hist = CPKChartGenerator.CreateCapabilityHistogram(r);
+                    string imgPath = SaveChartImage(hist);
+                    tmpFiles.Add(imgPath);
+
+                    var paraImg = row.Cells[0].AddParagraph();
+                    var src = ImageSource.FromFile(imgPath);
+                    var img = paraImg.AddImage(src);
+                    img.LockAspectRatio = true;
+                    img.Width = Unit.FromCentimeter(18.5);
+
+                    hist.Dispose();
+                }
+
+                var summary = BuildSummaryText(r);
+                var paraSum = row.Cells[1].AddParagraph(summary);
+                paraSum.Format.Font.Size = 9;
+
+                var pageBreak = section.AddParagraph();
+                pageBreak.Format.PageBreakBefore = true;
+            }
+
+            void InsertRawDataTable(Section section, ProcessCapabilityAnalyzer.CapabilityResult r)
+            {
+                var dataTitle = section.AddParagraph($"{r.ItemName} - 측정 데이터", "Heading");
+                dataTitle.Format.SpaceBefore = "3mm";
+                dataTitle.Format.SpaceAfter = "2mm";
+                dataTitle.Format.KeepWithNext = true;
+
+                int dataCount = r.RawData.Length;
+                int columnsPerRow = 10;
+                int rowsNeeded = (int)Math.Ceiling(dataCount / (double)columnsPerRow);
+
+                var table = section.AddTable();
+                table.Borders.Width = 0.5;
+                table.Rows.LeftIndent = 0;
+                table.Format.Font.Name = "Malgun Gothic";
+                table.Format.Font.Size = 8;
+
+                for (int i = 0; i < columnsPerRow; i++)
+                {
+                    table.AddColumn(Unit.FromCentimeter(1.2));
+                    table.AddColumn(Unit.FromCentimeter(1.8));
+                }
+
+                var headerRow = table.AddRow();
+                headerRow.HeadingFormat = true;
+                headerRow.Shading.Color = Colors.LightGray;
+                headerRow.Format.Font.Bold = true;
+
+                for (int i = 0; i < columnsPerRow; i++)
+                {
+                    headerRow.Cells[i * 2].AddParagraph("No.");
+                    headerRow.Cells[i * 2].Format.Alignment = ParagraphAlignment.Center;
+                    headerRow.Cells[i * 2 + 1].AddParagraph($"값 ({r.Unit})");
+                    headerRow.Cells[i * 2 + 1].Format.Alignment = ParagraphAlignment.Center;
+                }
+
+                for (int row = 0; row < rowsNeeded; row++)
+                {
+                    var dataRow = table.AddRow();
+
+                    for (int col = 0; col < columnsPerRow; col++)
+                    {
+                        int dataIndex = row * columnsPerRow + col;
+
+                        if (dataIndex < dataCount)
+                        {
+                            dataRow.Cells[col * 2].AddParagraph($"{dataIndex + 1}");
+                            dataRow.Cells[col * 2].Format.Alignment = ParagraphAlignment.Center;
+
+                            dataRow.Cells[col * 2 + 1].AddParagraph($"{r.RawData[dataIndex]:F4}");
+                            dataRow.Cells[col * 2 + 1].Format.Alignment = ParagraphAlignment.Right;
+                        }
+                        else
+                        {
+                            dataRow.Cells[col * 2].AddParagraph("");
+                            dataRow.Cells[col * 2 + 1].AddParagraph("");
+                        }
+                    }
+                }
+
+                var statsPara = section.AddParagraph();
+                statsPara.Format.SpaceBefore = "3mm";
+                statsPara.Format.Font.Size = 9;
+                statsPara.AddFormattedText("데이터 통계: ", TextFormat.Bold);
+                statsPara.AddText(
+                    $"개수={dataCount}, " +
+                    $"평균={r.Mean:F4}, " +
+                    $"표준편차={r.StdDev:F4}, " +
+                    $"최소={r.RawData.Min():F4}, " +
+                    $"최대={r.RawData.Max():F4}"
+                );
+
+                var pageBreak = section.AddParagraph();
+                pageBreak.Format.PageBreakBefore = true;
+            }
+
+            void AddImageFlexible(Section section, string imagePath, double widthCm)
+            {
+                if (!File.Exists(imagePath))
+                    throw new FileNotFoundException($"이미지 파일이 없습니다: {imagePath}");
+
+                var src = ImageSource.FromFile(imagePath);
+                var img = section.AddImage(src);
+                img.LockAspectRatio = true;
+                img.Width = Unit.FromCentimeter(widthCm);
             }
         }
 
@@ -1181,7 +1519,6 @@ Ppk = {currentResult.Ppk:F4}
                 ch.SaveImage(tmp, ChartImageFormat.Png);
                 return tmp;
             }
-
 
             void InsertChartsForResult(Section section, ProcessCapabilityAnalyzer.CapabilityResult r, List<string> tempFiles)
             {
@@ -1257,17 +1594,7 @@ Ppk = {currentResult.Ppk:F4}
             info.AddText($"총 항목 수: {this.testItems?.Count ?? 0}\n");
             info.Format.SpaceAfter = "6mm";
 
-            // 4) 상세 결과(우측 텍스트박스)
-            /*var resTitle = sec.AddParagraph("상세 결과 (선택 항목):", "Heading");
-            resTitle.Format.SpaceBefore = "3mm";
-
-            var res = sec.AddParagraph();
-            res.Format.Font.Name = "Malgun Gothic";   // 한글 깨짐 방지 (모노스페이스 사용 X)
-            res.Format.Font.Size = 9;
-            res.AddText(this.resultsTextBox.Text);
-            res.Format.SpaceAfter = "8mm";*/
-
-            // 5) 데이터 요약 테이블 (DataGridView)
+            // 4) 데이터 요약 테이블 (DataGridView)
             var tblTitle = sec.AddParagraph("데이터 요약(그리드):", "Heading");
             tblTitle.Format.SpaceBefore = "3mm";
 
@@ -1322,6 +1649,7 @@ Ppk = {currentResult.Ppk:F4}
                 if (currentResult != null)
                 {
                     InsertChartAndSummarySideBySide(sec, currentResult, tempFilesList);
+                    InsertRawDataTable(sec, currentResult); // ★ RAW 데이터 추가
                 }
                 else
                 {
@@ -1335,9 +1663,8 @@ Ppk = {currentResult.Ppk:F4}
                                         valid, item.LSL, item.USL, item.ItemName, item.Unit, true, item.Step);
 
                         InsertChartAndSummarySideBySide(sec, rEach, tempFilesList);
-                        // (항목마다 새 페이지를 쓰고 있다면 이 아래에 아무 것도 추가하지 마세요)
+                        InsertRawDataTable(sec, rEach); // ★ RAW 데이터 추가
                     }
-
                 }
             }
             finally
@@ -1356,43 +1683,10 @@ Ppk = {currentResult.Ppk:F4}
 
             // ====== 로컬 헬퍼들 ======
 
-            // 차트들을 PNG로 저장하고 섹션에 삽입
-            string[] SaveChartsAndInsert(Section section, Panel panel)
-            {
-                if (section == null) throw new ArgumentNullException(nameof(section));
-                if (panel == null) throw new ArgumentNullException(nameof(panel));
-
-                var list = new System.Collections.Generic.List<string>();
-                int idx = 1;
-
-                foreach (Control ctrl in panel.Controls)
-                {
-                    if (ctrl is Chart ch)
-                    {
-                        // 저장
-                        string tmp = Path.Combine(Path.GetTempPath(), $"cpk_chart_{idx++}_{Guid.NewGuid():N}.png");
-
-                        // 렌더 품질 살짝 올리기
-                        ch.AntiAliasing = AntiAliasingStyles.All;
-                        ch.TextAntiAliasingQuality = TextAntiAliasingQuality.High;
-
-                        ch.SaveImage(tmp, ChartImageFormat.Png);
-                        list.Add(tmp);
-
-                        // PDF에 삽입 (버전 자동대응)
-                        AddImageFlexible(section, tmp, 24.0 /* A4 가로의 넓은 폭 확보 */);
-
-                        var spacer = section.AddParagraph();
-                        spacer.Format.SpaceAfter = "3mm";
-                    }
-                }
-
-                return list.ToArray();
-            }
             void InsertChartAndSummarySideBySide(
-    Section section,
-    ProcessCapabilityAnalyzer.CapabilityResult r,
-    List<string> tmpFiles)
+                Section section,
+                ProcessCapabilityAnalyzer.CapabilityResult r,
+                List<string> tmpFiles)
             {
                 // 제목: 다음 표와 같은 페이지에 붙이기
                 var h = section.AddParagraph($"{r.Step} - {r.ItemName} – 차트 & 분석 요약", "Heading");
@@ -1448,6 +1742,92 @@ Ppk = {currentResult.Ppk:F4}
                 pageBreak.Format.PageBreakBefore = true;       // ★ 다음 항목은 새 페이지에서 시작
             }
 
+            // RAW 데이터 테이블 삽입 함수
+            void InsertRawDataTable(Section section, ProcessCapabilityAnalyzer.CapabilityResult r)
+            {
+                // 제목
+                var dataTitle = section.AddParagraph($"{r.ItemName} - 측정 데이터", "Heading");
+                dataTitle.Format.SpaceBefore = "3mm";
+                dataTitle.Format.SpaceAfter = "2mm";
+                dataTitle.Format.KeepWithNext = true;
+
+                // 데이터 개수에 따라 열 수 결정 (한 페이지에 들어갈 수 있도록)
+                int dataCount = r.RawData.Length;
+                int columnsPerRow = 5; // 한 행에 10개씩 표시
+                int rowsNeeded = (int)Math.Ceiling(dataCount / (double)columnsPerRow);
+
+                var table = section.AddTable();
+                table.Borders.Width = 0.5;
+                table.Rows.LeftIndent = 0;
+                table.Format.Font.Name = "Malgun Gothic";
+                table.Format.Font.Size = 8;
+
+                // 열 추가 (번호 + 값) * columnsPerRow
+                for (int i = 0; i < columnsPerRow; i++)
+                {
+                    table.AddColumn(Unit.FromCentimeter(1.2)); // 번호
+                    table.AddColumn(Unit.FromCentimeter(1.8)); // 값
+                }
+
+                // 헤더 행
+                var headerRow = table.AddRow();
+                headerRow.HeadingFormat = true;
+                headerRow.Shading.Color = Colors.LightGray;
+                headerRow.Format.Font.Bold = true;
+
+                for (int i = 0; i < columnsPerRow; i++)
+                {
+                    headerRow.Cells[i * 2].AddParagraph("No.");
+                    headerRow.Cells[i * 2].Format.Alignment = ParagraphAlignment.Center;
+                    headerRow.Cells[i * 2 + 1].AddParagraph($"값 ({r.Unit})");
+                    headerRow.Cells[i * 2 + 1].Format.Alignment = ParagraphAlignment.Center;
+                }
+
+                // 데이터 행
+                for (int row = 0; row < rowsNeeded; row++)
+                {
+                    var dataRow = table.AddRow();
+
+                    for (int col = 0; col < columnsPerRow; col++)
+                    {
+                        int dataIndex = row * columnsPerRow + col;
+
+                        if (dataIndex < dataCount)
+                        {
+                            // 번호
+                            dataRow.Cells[col * 2].AddParagraph($"{dataIndex + 1}");
+                            dataRow.Cells[col * 2].Format.Alignment = ParagraphAlignment.Center;
+
+                            // 값
+                            dataRow.Cells[col * 2 + 1].AddParagraph($"{r.RawData[dataIndex]:F4}");
+                            dataRow.Cells[col * 2 + 1].Format.Alignment = ParagraphAlignment.Right;
+                        }
+                        else
+                        {
+                            // 빈 셀
+                            dataRow.Cells[col * 2].AddParagraph("");
+                            dataRow.Cells[col * 2 + 1].AddParagraph("");
+                        }
+                    }
+                }
+
+                // 통계 요약 추가
+                var statsPara = section.AddParagraph();
+                statsPara.Format.SpaceBefore = "3mm";
+                statsPara.Format.Font.Size = 9;
+                statsPara.AddFormattedText("데이터 통계: ", TextFormat.Bold);
+                statsPara.AddText(
+                    $"개수={dataCount}, " +
+                    $"평균={r.Mean:F4}, " +
+                    $"표준편차={r.StdDev:F4}, " +
+                    $"최소={r.RawData.Min():F4}, " +
+                    $"최대={r.RawData.Max():F4}"
+                );
+
+                // 다음 항목을 위한 페이지 분리
+                var pageBreak = section.AddParagraph();
+                pageBreak.Format.PageBreakBefore = true;
+            }
 
             // MigraDocCore 버전별 AddImage(...) 자동 대응
             void AddImageFlexible(Section section, string imagePath, double widthCm)
@@ -1460,61 +1840,67 @@ Ppk = {currentResult.Ppk:F4}
                 var img = section.AddImage(src);
                 img.LockAspectRatio = true;
                 img.Width = Unit.FromCentimeter(widthCm);
-
-                // 만약 위 줄이 컴파일 안되면, 아래 두 줄로 대체:
-                // var img2 = section.AddImage(imagePath);
-                // img2.LockAspectRatio = true; img2.Width = Unit.FromCentimeter(widthCm);
             }
+        }
 
-            void InsertSummaryAndChartAsTwoPages(
-    Section section,
-    ProcessCapabilityAnalyzer.CapabilityResult r,
-    List<string> tmpFiles)
+    }
+
+    public class ProgressDialog : Form
+    {
+        public ProgressBar ProgressBar { get; private set; }
+        public Label StatusLabel { get; private set; }
+
+        public ProgressDialog(string title, int maximum)
+        {
+            this.Text = title;
+            this.Size = new SD.Size(520, 150);
+            this.StartPosition = FormStartPosition.CenterParent;
+            this.FormBorderStyle = FormBorderStyle.FixedDialog;
+            this.MaximizeBox = false;
+            this.MinimizeBox = false;
+            this.ControlBox = false;
+
+            StatusLabel = new Label
             {
-                // --- Page 1: 분석 요약 전용 페이지 ---
-                // 제목
-                var h1 = section.AddParagraph($"{r.ItemName} - 분석 요약", "Heading");
-                h1.Format.SpaceBefore = "0mm";
-                // 요약 본문
-                var summaryPara = section.AddParagraph(BuildSummaryText(r));
-                summaryPara.Format.Font.Name = "Malgun Gothic";
-                summaryPara.Format.Font.Size = 9;
+                Location = new SD.Point(20, 20),
+                Size = new SD.Size(460, 30),
+                Text = "준비 중...",
+                Font = new SD.Font("Consolas", 9) // 고정폭 폰트로 변경
+            };
 
-                // 요약 페이지 끝 → 다음 페이지로
-                var pb1 = section.AddParagraph();
-                pb1.Format.PageBreakBefore = true; // ★ 다음 페이지로 넘김
+            ProgressBar = new ProgressBar
+            {
+                Location = new SD.Point(20, 60),
+                Size = new SD.Size(460, 30),
+                Minimum = 0,
+                Maximum = maximum,
+                Value = 0,
+                Style = ProgressBarStyle.Continuous
+            };
 
-                // --- Page 2: 차트 전용 페이지 ---
-                if (r.StdDev <= 1e-10)
-                {
-                    // 변동 0이면 차트 대신 안내만 (차트 페이지에도 안내)
-                    var noVar = section.AddParagraph($"{r.ItemName} - 변동 없음(모든 값 동일)", "Heading");
-                    noVar.Format.SpaceBefore = "0mm";
+            this.Controls.Add(StatusLabel);
+            this.Controls.Add(ProgressBar);
+        }
 
-                    var txt = section.AddParagraph(
-                        $"측정값 {r.Mean:F4} {r.Unit}, LSL {r.LSL:F4}, USL {r.USL:F4}\n" +
-                        "표준편차가 0으로 차트를 생략합니다.");
-                    txt.Format.Font.Name = "Malgun Gothic";
-                    txt.Format.Font.Size = 9;
-                }
-                else
-                {
-                    // 히스토그램 즉석 생성 → PNG 저장 → 한 페이지 꽉 채우기
-                    var hist = CPKChartGenerator.CreateCapabilityHistogram(r);
-                    string histPath = SaveChartImage(hist);  // 기존 helper 사용
-                    tmpFiles.Add(histPath);
-
-                    // 이미지 삽입 (A4 가로, 좌우 15mm 여백 고려 — 24cm면 꽉 찹니다)
-                    AddImageFlexible(section, histPath, 24.0); // 기존 helper 사용
-
-                    hist.Dispose();
-                }
-
-                // 차트 페이지도 종료하고 다음 항목은 새 페이지에서 시작하게 설정
-                var pb2 = section.AddParagraph();
-                pb2.Format.PageBreakBefore = true; // ★ 다음 항목 대비 페이지 분리
+        public void UpdateProgress(int value, string status)
+        {
+            if (this.InvokeRequired)
+            {
+                this.Invoke(new Action(() => UpdateProgress(value, status)));
+                return;
             }
 
+            ProgressBar.Value = Math.Min(value, ProgressBar.Maximum);
+
+            // 퍼센트 표시 추가로 텍스트 길이 일정하게 유지
+            int percent = ProgressBar.Maximum > 0
+                ? (int)((double)value / ProgressBar.Maximum * 100)
+                : 0;
+            StatusLabel.Text = $"[{percent,3}%] {status}";
+
+            this.Refresh();
         }
     }
+
+
 }
